@@ -1,0 +1,634 @@
+{
+  "info": {
+    "_postman_id": "8f3c1d20-5b7a-4d4e-9c11-kaspi001",
+    "name": "Kaspi POS Simulator",
+    "description": "Kaspi POS 终端模拟器调试集合。\n\n启动建议（Postman 调试用）：\n  python kaspi_pos_simulator.py --http --port 8080\n  python kaspi_pos_simulator.py --http --fast --port 8080   # 时序压缩到 ~1 秒，快速跑完整流程\n  python kaspi_pos_simulator.py --http --secure --port 8080 # 需要 accesstoken 头\n\n注意：\n1. 模拟器默认 HTTPS + 自签证书。用 --http 可省去证书校验；若坚持 HTTPS，请在 Postman\n   Settings → General 关闭 \"SSL certificate verification\"。\n2. /v2/status 必须带 terminalid 头（手册 3.18），默认终端号 31452963。\n3. 状态按真实时间推进：发起支付后等约 6 秒（--fast 约 1 秒）再点 status，\n   或连点几次 Send 观察 Initialize → WaitUser → WaitForQrConfirmation → QrTransactionSuccess。\n4. 退款必须先有一笔成功支付：transactionId 由 status 响应自动写入集合变量。\n5. 同一时刻只允许一笔未完成交易，卡住时用「reset - 清空全部交易」。\n6. 业务结果一律看 body 的 statusCode，HTTP 码只表示协议层（400 参数 / 401 鉴权 / 403 令牌过期 / 404 路径）。",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:8080" },
+    { "key": "terminalId", "value": "31452963" },
+    { "key": "accessToken", "value": "" },
+    { "key": "refreshToken", "value": "" },
+    { "key": "processId", "value": "" },
+    { "key": "transactionId", "value": "" },
+    { "key": "amount", "value": "1000" }
+  ],
+  "event": [
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// 统一打印业务码，避免只看 HTTP 码被误导",
+          "try {",
+          "    const b = pm.response.json();",
+          "    const biz = b.statusCode;",
+          "    const label = biz === 0 ? 'OK' : 'BIZ-' + biz;",
+          "    console.log(pm.info.requestName + ' -> HTTP ' + pm.response.code + ' | ' + label + (b.errorText ? ' | ' + b.errorText : ''));",
+          "    pm.test('response has statusCode field', () => pm.expect(b).to.have.property('statusCode'));",
+          "} catch (e) {",
+          "    console.log(pm.info.requestName + ' -> HTTP ' + pm.response.code + ' (non-JSON body)');",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "00 基础",
+      "item": [
+        {
+          "name": "deviceinfo - 终端信息",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/v2/deviceinfo", "host": ["{{baseUrl}}"], "path": ["v2", "deviceinfo"] }
+          }
+        },
+        {
+          "name": "register - 换取 token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    const d = pm.response.json().data;",
+                  "    if (d && d.accessToken) {",
+                  "        pm.collectionVariables.set('accessToken', d.accessToken);",
+                  "        pm.collectionVariables.set('refreshToken', d.refreshToken);",
+                  "        console.log('token 已保存，expirationDate = ' + d.expirationDate);",
+                  "    }",
+                  "    pm.test('expirationDate 格式为 YYYY-MM-DD HH:MM:SS', () => {",
+                  "        pm.expect(d.expirationDate).to.match(/^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$/);",
+                  "    });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/v2/register?name=Kashier1", "host": ["{{baseUrl}}"], "path": ["v2", "register"], "query": [{ "key": "name", "value": "Kashier1" }] }
+          }
+        },
+        {
+          "name": "reset - 清空全部交易",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/v2/reset", "host": ["{{baseUrl}}"], "path": ["v2", "reset"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "01 支付主流程",
+      "item": [
+        {
+          "name": "payment - QR 支付 1000",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "if (b.statusCode === 0) {",
+                  "    pm.collectionVariables.set('processId', b.data.processId);",
+                  "    console.log('processId = ' + b.data.processId);",
+                  "} else if (b.statusCode === 107) {",
+                  "    console.warn('上一笔交易未完成，先调用 reset 或查询其状态');",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v2/payment?amount={{amount}}&method=qr",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "payment"],
+              "query": [
+                { "key": "amount", "value": "{{amount}}" },
+                { "key": "method", "value": "qr" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "payment - 银行卡支付",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "if (b.statusCode === 0) pm.collectionVariables.set('processId', b.data.processId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v2/payment?amount={{amount}}&method=card",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "payment"],
+              "query": [
+                { "key": "amount", "value": "{{amount}}" },
+                { "key": "method", "value": "card" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "payment - 刷掌 alaqan",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "if (b.statusCode === 0) pm.collectionVariables.set('processId', b.data.processId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v2/payment?amount={{amount}}&method=alaqan",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "payment"],
+              "query": [
+                { "key": "amount", "value": "{{amount}}" },
+                { "key": "method", "value": "alaqan" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "status - 查询（约 6 秒后出终态）",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "if (b.statusCode === 0) {",
+                  "    const d = b.data;",
+                  "    console.log('status = ' + d.status + ' / subStatus = ' + d.subStatus);",
+                  "    if (d.status === 'success') {",
+                  "        pm.collectionVariables.set('transactionId', d.transactionId);",
+                  "        console.log('transactionId = ' + d.transactionId + ' (退款要用)');",
+                  "    }",
+                  "    pm.test('subStatus 在手册 11 个枚举内', () => {",
+                  "        const allowed = ['Initialize','WaitUser','WaitForQrConfirmation','ProcessingCard','WaitForPinCode','ProcessRefund','QrTransactionSuccess','QrTransactionFailure','CardTransactionSuccess','CardTransactionFailure','ProcessCancelled'];",
+                  "        pm.expect(allowed).to.include(d.subStatus);",
+                  "    });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "terminalid", "value": "{{terminalId}}" }],
+            "url": {
+              "raw": "{{baseUrl}}/v2/status?processId={{processId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "status"],
+              "query": [{ "key": "processId", "value": "{{processId}}" }]
+            }
+          }
+        },
+        {
+          "name": "payment - 失败分支 outcome=fail",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "if (b.statusCode === 0) pm.collectionVariables.set('processId', b.data.processId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v2/payment?amount={{amount}}&method=card&outcome=fail",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "payment"],
+              "query": [
+                { "key": "amount", "value": "{{amount}}" },
+                { "key": "method", "value": "card" },
+                { "key": "outcome", "value": "fail" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "02 退款",
+      "item": [
+        {
+          "name": "refund - 全额退款（方式须与原支付一致）",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "if (b.statusCode === 0) {",
+                  "    pm.collectionVariables.set('processId', b.data.processId);",
+                  "} else {",
+                  "    console.warn('退款被拒: ' + b.errorText);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v2/refund?amount={{amount}}&method=qr&transactionId={{transactionId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "refund"],
+              "query": [
+                { "key": "amount", "value": "{{amount}}" },
+                { "key": "method", "value": "qr" },
+                { "key": "transactionId", "value": "{{transactionId}}" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "refund - 部分退款 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "if (b.statusCode === 0) pm.collectionVariables.set('processId', b.data.processId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v2/refund?amount=400&method=qr&transactionId={{transactionId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "refund"],
+              "query": [
+                { "key": "amount", "value": "400" },
+                { "key": "method", "value": "qr" },
+                { "key": "transactionId", "value": "{{transactionId}}" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "remains - 退剩余金额",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "if (b.statusCode === 0) pm.collectionVariables.set('processId', b.data.processId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v2/remains?transactionId={{transactionId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "remains"],
+              "query": [{ "key": "transactionId", "value": "{{transactionId}}" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "03 状态未知 / 补确认",
+      "item": [
+        {
+          "name": "payment - unknown 分支",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "if (b.statusCode === 0) pm.collectionVariables.set('processId', b.data.processId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v2/payment?amount={{amount}}&method=card&outcome=unknown",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "payment"],
+              "query": [
+                { "key": "amount", "value": "{{amount}}" },
+                { "key": "method", "value": "card" },
+                { "key": "outcome", "value": "unknown" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "actualize - 补确认转成功",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "terminalid", "value": "{{terminalId}}" }],
+            "url": {
+              "raw": "{{baseUrl}}/v2/actualize?processId={{processId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "actualize"],
+              "query": [{ "key": "processId", "value": "{{processId}}" }]
+            }
+          }
+        },
+        {
+          "name": "actualize - 模拟无网络 statusCode 100",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "terminalid", "value": "{{terminalId}}" }],
+            "url": {
+              "raw": "{{baseUrl}}/v2/actualize?processId={{processId}}&outcome=nointernet",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "actualize"],
+              "query": [
+                { "key": "processId", "value": "{{processId}}" },
+                { "key": "outcome", "value": "nointernet" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "actualize - 10 秒内重复调用（应被节流 105）",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "pm.test('节流返回 statusCode 105', () => pm.expect(b.statusCode).to.eql(105));",
+                  "console.log('data.message = ' + (b.data && b.data.message));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "terminalid", "value": "{{terminalId}}" }],
+            "url": {
+              "raw": "{{baseUrl}}/v2/actualize?processId={{processId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "actualize"],
+              "query": [{ "key": "processId", "value": "{{processId}}" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "04 令牌（--secure 模式）",
+      "item": [
+        {
+          "name": "revoke - 轮换令牌",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "if (b.statusCode === 0 && b.data) {",
+                  "    pm.collectionVariables.set('accessToken', b.data.accessToken);",
+                  "    pm.collectionVariables.set('refreshToken', b.data.refreshToken);",
+                  "    console.log('令牌已轮换');",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "accesstoken", "value": "{{accessToken}}" }],
+            "url": {
+              "raw": "{{baseUrl}}/v2/revoke?name=Kashier1&refreshToken={{refreshToken}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "revoke"],
+              "query": [
+                { "key": "name", "value": "Kashier1" },
+                { "key": "refreshToken", "value": "{{refreshToken}}" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "deviceinfo - 带 accesstoken",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "accesstoken", "value": "{{accessToken}}" }],
+            "url": { "raw": "{{baseUrl}}/v2/deviceinfo", "host": ["{{baseUrl}}"], "path": ["v2", "deviceinfo"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "05 异常与边界",
+      "item": [
+        {
+          "name": "status - 缺 terminalid 头（应 400/999）",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 400', () => pm.response.to.have.status(400));",
+                  "pm.test('业务码 999', () => pm.expect(pm.response.json().statusCode).to.eql(999));",
+                  "console.log('errorText = ' + pm.response.json().errorText);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v2/status?processId={{processId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "status"],
+              "query": [{ "key": "processId", "value": "{{processId}}" }]
+            }
+          }
+        },
+        {
+          "name": "refund - 方式与原支付不一致（应 400/999）",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 400', () => pm.response.to.have.status(400));",
+                  "console.log('errorText = ' + pm.response.json().errorText);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v2/refund?amount=100&method=card&transactionId={{transactionId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "refund"],
+              "query": [
+                { "key": "amount", "value": "100" },
+                { "key": "method", "value": "card" },
+                { "key": "transactionId", "value": "{{transactionId}}" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "refund - 伪造 transactionId（应 400/999）",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 400', () => pm.response.to.have.status(400));",
+                  "console.log('errorText = ' + pm.response.json().errorText);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v2/refund?amount=100&method=qr&transactionId=TOTALLY-FAKE-ID",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "refund"],
+              "query": [
+                { "key": "amount", "value": "100" },
+                { "key": "method", "value": "qr" },
+                { "key": "transactionId", "value": "TOTALLY-FAKE-ID" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "payment - 金额非整数（应 400/999）",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 400', () => pm.response.to.have.status(400));",
+                  "console.log('errorText = ' + pm.response.json().errorText);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v2/payment?amount=10.5",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "payment"],
+              "query": [{ "key": "amount", "value": "10.5" }]
+            }
+          }
+        },
+        {
+          "name": "status - 不存在的 processId（应 200/101）",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200 + 业务码 101', () => {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json().statusCode).to.eql(101);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "terminalid", "value": "{{terminalId}}" }],
+            "url": {
+              "raw": "{{baseUrl}}/v2/status?processId=does-not-exist",
+              "host": ["{{baseUrl}}"],
+              "path": ["v2", "status"],
+              "query": [{ "key": "processId", "value": "does-not-exist" }]
+            }
+          }
+        },
+        {
+          "name": "无效路径（应 404）",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 404', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/v2/nope", "host": ["{{baseUrl}}"], "path": ["v2", "nope"] }
+          }
+        }
+      ]
+    }
+  ]
+}
