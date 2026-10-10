@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlparse
 logger = logging.getLogger("KaspiPOSSimulator")
 
 # 控制台页眉显示的构建标记，用来确认浏览器连的是不是当前这份代码
-UI_BUILD = "v5-approve3"
+UI_BUILD = "v5-approve5"
 
 MOCK_DATA = {
     "storeName": "Тестовый магазин",
@@ -976,10 +976,30 @@ class KaspiPOSSimulatorHandler(BaseHTTPRequestHandler):
                 return
         self._issue_token(params["name"])
 
+    def _client_alive(self):
+        """探测收银机是否还连着（用 MSG_PEEK，不消耗数据）。
+
+        收银机往往有自己的超时并会先断开，而模拟器原本会一直傻等到
+        register_timeout 秒、期间 pending 请求不释放 —— /ui 的弹窗就一直挂着
+        （那个请求其实已经没人要了）。只有明确读到 EOF 才判定断开。
+        """
+        sock = getattr(self, "connection", None)
+        if sock is None:
+            return True
+        try:
+            sock.setblocking(False)
+            try:
+                data = sock.recv(1, socket.MSG_PEEK)
+            finally:
+                sock.setblocking(True)
+        except Exception:  # noqa: BLE001 - 探测不了就当还活着，避免误杀等待中的收银机
+            return True
+        return data != b""  # b"" 表示对端已关闭
+
     def _await_registration_approval(self, name):
         """把这次注册挂起，等控制台在 /ui 弹窗里点「允许注册 / 拒绝」。
 
-        返回 True 表示放行；False 表示失败响应已经发出去了。
+        返回 True 表示放行；False 表示失败响应已经发出去了（或请求已被丢弃）。
         """
         global pending_registration
         request = {
@@ -1006,10 +1026,29 @@ class KaspiPOSSimulatorHandler(BaseHTTPRequestHandler):
             "Registration request %s for %s: waiting for the /ui confirmation "
             "(timeout %gs)", request["id"], name, timeout,
         )
-        answered = request["event"].wait(timeout)
+        answered = False
+        client_gone = False
+        deadline = time.time() + timeout
+        while True:
+            if request["event"].wait(0.5):
+                answered = True
+                break
+            if time.time() >= deadline:
+                break
+            if not self._client_alive():
+                client_gone = True
+                break
         with _state_lock:
             if pending_registration is request:
                 pending_registration = None
+        if client_gone:
+            # 收银机已经断开：这次请求没人要了，别让 /ui 弹窗继续挂着
+            logger.warning(
+                "Registration request %s dropped: the cashier disconnected",
+                request["id"],
+            )
+            self.close_connection = True
+            return False
         if not answered:
             self._handle_error(
                 105,
@@ -1327,9 +1366,17 @@ def run(
         tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls_context.load_cert_chain(certfile=cert, keyfile=key)
 
-    httpd = KaspiSimulatorServer(
-        (host, port), KaspiPOSSimulatorHandler, tls_context=tls_context
-    )
+    try:
+        httpd = KaspiSimulatorServer(
+            (host, port), KaspiPOSSimulatorHandler, tls_context=tls_context
+        )
+    except OSError as exc:
+        raise SystemExit(
+            f"Cannot listen on {host}:{port} ({exc}).\n"
+            "Another instance is probably still running on this port - stop it "
+            "first (or start with another --port), otherwise the browser keeps "
+            "talking to the OLD process and its pending registration stays."
+        ) from exc
     httpd.secure_api = secure_api
     httpd.cors_enabled = cors_enabled
     httpd.ui_enabled = ui_enabled
@@ -1586,6 +1633,9 @@ pre{margin:0;background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;
 .modal h3{margin:0 0 10px;font-size:16px}
 .modal p{margin:0 0 8px;font-size:13px}
 .modal .btns{display:flex;gap:10px;margin-top:16px}
+/* 必须比 .modal 更具体：.modal 的 display:flex 声明在 .hidden 之后，
+   同为单类选择器会盖掉 .hidden 的 display:none，弹窗就再也关不掉 */
+.modal.hidden{display:none}
 </style>
 </head>
 <body>
@@ -1714,6 +1764,7 @@ pre{margin:0;background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;
     <div class="btns">
       <button class="primary" id="btnAllow">允许注册</button>
       <button class="ghost" id="btnDeny">拒绝</button>
+      <button class="ghost" id="btnDismiss">稍后处理</button>
     </div>
   </div>
 </div>
@@ -1949,57 +2000,73 @@ $('btnReset').onclick = async function(){
   }catch(e){ alert(e.message); }
 };
 
-var shownRequest = null, approving = false;
+var shownRequest = null, approving = false, approvingAt = 0;
+var DECIDED = {};          // 点过「允许/拒绝/稍后处理」的请求 id：永不再弹，避免关了又弹
+var LAST_PENDING = null;   // 最近一次拿到的待审批请求，按钮据此记账
+var POLL_FAILS = 0;        // 连续轮询失败次数：长时间拿不到状态就收起，别永久挂着
+
 function closeApproval(){
   shownRequest = null;
   $('approveModal').classList.add('hidden');
 }
 function maybeAskApproval(pending){
-  if (approving) return;                     // 正在提交，别动弹窗
   var modal = $('approveModal');
-  if (pending){
-    if (shownRequest !== pending.id){        // 同一个请求只弹一次
-      shownRequest = pending.id;
-      $('apName').textContent = '收银软件「' + pending.name + '」请求注册（'
-        + pending.requestedAt + '）';
-      $('apHint').textContent = '来自收银软件的 /v2/register 调用，还剩约 ' +
-        pending.expiresIn + ' 秒：不处理会自动失败。允许才签发 token，拒绝则本次注册失败。';
-      $('apErr').textContent = '';
-      modal.classList.remove('hidden');
-    }
-  }else{
-    // 服务端没有待审批请求就无条件收起：不依赖 shownRequest，避免并发轮询的
-    // 旧响应把弹窗又拉起来（注册成功后还挂着就是这个原因）
-    closeApproval();
-  }
+  // 服务端没有待审批请求 —— 无条件收起，且不能被 approving 挡住
+  // （否则「点允许 -> 关闭 -> 旧轮询响应后到 -> 又弹开」的时序会让它一直显示）
+  if (!pending){ POLL_FAILS = 0; LAST_PENDING = null; closeApproval(); return; }
+  LAST_PENDING = pending;
+  if (approving && Date.now() - approvingAt < 10000) return;  // 提交中不开新弹窗
+  approving = false;                                          // 卡住的提交状态自动解除
+  if (DECIDED[pending.id]) return;           // 已处理过的请求不再打扰
+  if (pending.expiresIn <= 0) return;        // 即将超时，不弹
+  if (shownRequest === pending.id) return;   // 同一个请求只弹一次
+  shownRequest = pending.id;
+  $('apName').textContent = '收银软件「' + pending.name + '」请求注册（'
+    + pending.requestedAt + '，请求号 ' + pending.id + '）';
+  $('apHint').textContent = '来自收银软件的 /v2/register 调用，还剩约 ' +
+    pending.expiresIn + ' 秒：不处理会自动失败。允许才签发 token，拒绝则本次注册失败。';
+  $('apErr').textContent = '';
+  modal.classList.remove('hidden');
 }
 
 async function decideRegistration(allow){
-  if (approving) return;                     // 双击不算两次
-  approving = true;
+  // 先记账再发请求：无论这次调用成功与否，这个请求都不再弹出来
+  if (LAST_PENDING) DECIDED[LAST_PENDING.id] = 1;
+  if (approving){ closeApproval(); return; }   // 双击不算两次
+  approving = true; approvingAt = Date.now();
   $('btnAllow').disabled = true; $('btnDeny').disabled = true;
   $('apErr').textContent = '';
   try{
     var r = await call('/ui/registration/' + (allow ? 'approve' : 'reject'));
     show($('raw'), r.body);
+    closeApproval();                           // 点过就收起，不等下一轮轮询
     if (r.body.statusCode && r.body.statusCode !== 0){
       $('apErr').textContent = '[' + r.body.statusCode + '] ' + (r.body.errorText || '');
-      if (r.body.statusCode === 999) closeApproval();  // 请求已经没了（超时/已处理）
-      loadRegistration();
+      await loadRegistration();
       return;
     }
-    closeApproval();
     await loadRegistration();
-  }catch(e){ $('apErr').textContent = e.message; }
+  }catch(e){
+    $('apErr').textContent = e.message;
+    // 请求压根没发出去 —— 撤销售账并重新弹窗，否则用户看不到失败原因
+    if (LAST_PENDING) delete DECIDED[LAST_PENDING.id];
+    if (LAST_PENDING) maybeAskApproval(LAST_PENDING);
+  }
   finally{
     approving = false;
     $('btnAllow').disabled = false; $('btnDeny').disabled = false;
   }
 }
 
+function dismissApproval(){
+  if (LAST_PENDING) DECIDED[LAST_PENDING.id] = 1;
+  closeApproval();
+}
+
 async function loadRegistration(){
   try{
     var r = await call('/ui/registration');
+    POLL_FAILS = 0;
     maybeAskApproval(r.body.pending || null);
     var d = r.body.data;
     if (!d){
@@ -2023,7 +2090,11 @@ async function loadRegistration(){
     $('tokenHint').textContent = d.active
       ? '已注册：token 由收银机获取，页面自动同步使用。'
       : '该 token 已失效/已撤销：让收银机重新调用 /v2/register。';
-  }catch(e){ /* ignore */ }
+  }catch(e){
+    POLL_FAILS++;
+    // 连续 3 次（约 9 秒）拿不到状态就收起：否则弹窗会一直挂在那里
+    if (POLL_FAILS >= 3){ LAST_PENDING = null; closeApproval(); }
+  }
 }
 
 $('token').onchange = function(){
@@ -2036,6 +2107,7 @@ $('btnCopy').onclick = function(){
 };
 $('btnAllow').onclick = function(){ decideRegistration(true); };
 $('btnDeny').onclick = function(){ decideRegistration(false); };
+$('btnDismiss').onclick = function(){ dismissApproval(); };
 
 if (SECURE){ $('secureCard').classList.add('secure'); }
 $('mode').textContent = MANUAL ? '手动确认：需点按钮完成' : '自动完成';
